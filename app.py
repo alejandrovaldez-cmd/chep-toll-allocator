@@ -106,8 +106,33 @@ UNUSABLE_REGIONS = {"Unknown", "Reserved/Transit", "-", "", "nan"}
 
 
 # ─── VENDOR LOADERS ───────────────────────────────────────────────────────────
+def _read_excel_robust(file_bytes, **kwargs):
+    """Try multiple Excel engines for resilience against malformed files.
+
+    Bestpass portal exports sometimes produce .xlsx files that fail with the
+    default openpyxl engine (e.g., 'There is no item named xl/sharedStrings.xml
+    in the archive'). The calamine engine is more lenient and handles these
+    cases. We fall through several engines before giving up.
+    """
+    engines_to_try = ["openpyxl", "calamine", "xlrd"]
+    last_error = None
+    for engine in engines_to_try:
+        try:
+            if hasattr(file_bytes, "seek"):
+                file_bytes.seek(0)
+            return pd.read_excel(file_bytes, engine=engine, **kwargs)
+        except ImportError:
+            # Engine not installed — skip silently
+            continue
+        except Exception as e:
+            last_error = e
+            continue
+    # Re-raise the most recent real error so the user sees something useful
+    raise last_error if last_error else RuntimeError("No working Excel engine available")
+
+
 def load_premier(file_bytes):
-    df = pd.read_excel(file_bytes, sheet_name="Toll Lines")
+    df = _read_excel_robust(file_bytes, sheet_name="Toll Lines")
     df["Vendor"] = "Premier"
     df["UnitID"] = df["Equip ID"].astype(str)
     df["Amount"] = df["Line Total"]
@@ -125,7 +150,7 @@ def _read_sheet_flexible(file_bytes, candidates, header=0):
         try:
             if hasattr(file_bytes, "seek"):
                 file_bytes.seek(0)
-            return pd.read_excel(file_bytes, sheet_name=sheet_name, header=header)
+            return _read_excel_robust(file_bytes, sheet_name=sheet_name, header=header)
         except Exception as e:
             last_error = e
             continue
@@ -156,7 +181,7 @@ def load_star(file_bytes):
     return df
 
 def load_xtra(file_bytes):
-    df = pd.read_excel(file_bytes, sheet_name="Invoice detail", header=2)
+    df = _read_excel_robust(file_bytes, sheet_name="Invoice detail", header=2)
     df = df[df["Description"] == "Toll Fee"].copy()
     df["Vendor"] = "XTRA"
     df["UnitID"] = df["Unit #"].astype(str)
@@ -167,7 +192,7 @@ def load_xtra(file_bytes):
     return df
 
 def load_bestpass(file_bytes):
-    df = pd.read_excel(file_bytes, sheet_name="Toll Activity")
+    df = _read_excel_robust(file_bytes, sheet_name="Toll Activity")
     df["Vendor"] = "Bestpass"
     df["UnitID"] = df["Unit"].astype(str)
     df["Amount"] = df["Amount"]
@@ -236,7 +261,20 @@ def detect_vendor(file_obj):
     try:
         if hasattr(file_obj, "seek"):
             file_obj.seek(0)
-        xl = pd.ExcelFile(file_obj)
+        # Try multiple engines for robustness — Bestpass portal exports can be
+        # malformed in ways openpyxl rejects but calamine handles.
+        xl = None
+        for engine in ("openpyxl", "calamine", "xlrd"):
+            try:
+                if hasattr(file_obj, "seek"):
+                    file_obj.seek(0)
+                xl = pd.ExcelFile(file_obj, engine=engine)
+                break
+            except (ImportError, Exception):
+                continue
+        if xl is None:
+            return (None, "could not open file with any Excel engine")
+
         sheets = set(xl.sheet_names)
         for vendor, fingerprints in SHEET_FINGERPRINTS.items():
             if any(fp in sheets for fp in fingerprints):
@@ -245,14 +283,10 @@ def detect_vendor(file_obj):
         # 2. Column-header fingerprint — peek at first sheet
         if xl.sheet_names:
             try:
-                if hasattr(file_obj, "seek"):
-                    file_obj.seek(0)
                 # Try header on row 0 first, then row 2 (XTRA-style)
                 for hdr_row in (0, 2):
-                    if hasattr(file_obj, "seek"):
-                        file_obj.seek(0)
                     try:
-                        df_peek = pd.read_excel(
+                        df_peek = _read_excel_robust(
                             file_obj, sheet_name=xl.sheet_names[0],
                             header=hdr_row, nrows=2
                         )
@@ -279,7 +313,7 @@ def detect_vendor(file_obj):
 
 # ─── MAD LOOKUP BUILDER ───────────────────────────────────────────────────────
 def build_mad_lookups(mad_file_bytes):
-    mar = pd.read_excel(mad_file_bytes, sheet_name="Master Asset Record")
+    mar = _read_excel_robust(mad_file_bytes, sheet_name="Master Asset Record")
     mar["_priority"] = mar["Status"].map(
         {"Active": 0, "Active Rental": 0,
          "Pending Return / Displacement Market ": 1, "Onboarding": 1, "Standby": 1}
