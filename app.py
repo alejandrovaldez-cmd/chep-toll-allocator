@@ -115,13 +115,43 @@ def load_premier(file_bytes):
     df["CostCenter"] = None
     return df
 
+def _read_sheet_flexible(file_bytes, candidates, header=0):
+    """Try a list of possible sheet names and return the first that loads.
+    Useful when the same vendor's file has different sheet names depending on
+    whether it's a raw export vs an accounting-pre-mapped file."""
+    last_error = None
+    # Reset file pointer between attempts (uploaded files are seekable)
+    for sheet_name in candidates:
+        try:
+            if hasattr(file_bytes, "seek"):
+                file_bytes.seek(0)
+            return pd.read_excel(file_bytes, sheet_name=sheet_name, header=header)
+        except Exception as e:
+            last_error = e
+            continue
+    raise ValueError(
+        f"None of these sheet names were found: {candidates}. "
+        f"Last error: {last_error}"
+    )
+
+
 def load_star(file_bytes):
-    df = pd.read_excel(file_bytes, sheet_name="Invoice Lines")
-    df = df[df["Charge Type"] == "MAN - Manual Charge"].copy()
+    # Try accounting's pre-mapped sheet first, then raw export's "Sheet1"
+    df = _read_sheet_flexible(file_bytes, ["Invoice Lines", "Sheet1"])
+
+    # Filter to toll lines (Manual Charges only)
+    if "Charge Type" in df.columns:
+        df = df[df["Charge Type"] == "MAN - Manual Charge"].copy()
+
     df["Vendor"] = "Star"
     df["UnitID"] = df["Unit Number"].astype(str)
     df["Amount"] = df["Invoice Line Total"]
-    df["InvoiceDate"] = pd.to_datetime(df["Invoice Date"], format="%m-%d-%Y", errors="coerce")
+    # Date parsing: try the known format first, fall back to flexible parsing
+    df["InvoiceDate"] = pd.to_datetime(
+        df["Invoice Date"], format="%m-%d-%Y", errors="coerce"
+    )
+    if df["InvoiceDate"].isna().all():
+        df["InvoiceDate"] = pd.to_datetime(df["Invoice Date"], errors="coerce")
     df["CostCenter"] = None
     return df
 
