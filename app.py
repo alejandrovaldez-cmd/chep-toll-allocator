@@ -185,41 +185,54 @@ VENDOR_LOADERS = {
 
 
 # ─── VENDOR AUTO-DETECTION ────────────────────────────────────────────────────
-# Filename keywords (case-insensitive) — checked first
+# Filename keywords (case-insensitive) — these MUST be vendor-specific. Avoid
+# anything generic like "monthly", "report", "invoice" — those collide with
+# multiple vendors' export naming conventions.
 FILENAME_HINTS = {
-    "Premier":  ["premier", "ptlz", "ap bill report"],
-    "Star":     ["star"],
+    "Premier":  ["premier", "ptlz"],
+    "Star":     ["star_", "star leasing"],   # avoid bare "star" — too short, easy false-positives
     "XTRA":     ["xtra"],
     "Bestpass": ["bestpass", "fleetworthy"],
 }
 
-# Sheet-name fingerprints — content-sniffing fallback when filename is ambiguous
+# Sheet-name fingerprints — strong signals that uniquely identify a vendor's file
 SHEET_FINGERPRINTS = {
-    "Premier":  ["Toll Lines"],
-    "Star":     ["Invoice Lines"],          # accounting's pre-mapped sheet
+    "Premier":  ["Premier Data >", "Toll Lines"],
+    "Star":     ["Star Data >"],          # accounting's pre-mapped Star file has this tab
     "XTRA":     ["Invoice detail"],
     "Bestpass": ["Toll Activity"],
 }
+
+# Column-header fingerprints — for files where filename and sheet name aren't
+# helpful (e.g., raw exports with generic names like "Sheet1"). Each entry is
+# a set of columns that, taken together, uniquely identify a vendor's data.
+COLUMN_FINGERPRINTS = [
+    # Premier: Equip ID + Toll columns are unique to Premier's billing data
+    ("Premier", {"Equip ID", "Toll"}),
+    ("Premier", {"Equip ID", "Admin Fee"}),
+    ("Premier", {"Equip ID", "Toll Description"}),
+    # Star: Charge Type + Unit Number + Invoice Line Total — Star-specific naming
+    ("Star",    {"Charge Type", "Unit Number", "Invoice Line Total"}),
+    ("Star",    {"Inv Source", "Charge Type", "Unit Number"}),
+    # Bestpass: Cost Center + Transaction Desc + Agency
+    ("Bestpass", {"Cost Center", "Transaction Desc"}),
+    ("Bestpass", {"Cost Center", "Agency", "Plaza"}),
+]
 
 
 def detect_vendor(file_obj):
     """Identify which vendor a file belongs to.
 
-    Strategy:
-      1. Filename keywords (fast, works for most cases)
-      2. Sheet-name fingerprint (fallback for unusual filenames)
-      3. Column-header heuristic (last resort, e.g. for raw Star "Sheet1")
+    Strategy (in order of confidence):
+      1. Sheet-name fingerprint — strongest signal (vendor-specific sheets)
+      2. Column-header fingerprint — for raw exports w/ generic sheet names
+      3. Filename keyword — fallback, only for clearly vendor-named files
 
     Returns (vendor_name, detection_method) or (None, error_message).
     """
     name = getattr(file_obj, "name", "").lower()
 
-    # 1. Filename hint
-    for vendor, hints in FILENAME_HINTS.items():
-        if any(hint in name for hint in hints):
-            return (vendor, "filename")
-
-    # 2. Sheet-name fingerprint
+    # 1. Sheet-name fingerprint (most reliable)
     try:
         if hasattr(file_obj, "seek"):
             file_obj.seek(0)
@@ -229,29 +242,37 @@ def detect_vendor(file_obj):
             if any(fp in sheets for fp in fingerprints):
                 return (vendor, "sheet name")
 
-        # 3. Column-header heuristic — for raw exports w/ generic sheet names
-        # Try the first sheet and inspect headers
+        # 2. Column-header fingerprint — peek at first sheet
         if xl.sheet_names:
             try:
                 if hasattr(file_obj, "seek"):
                     file_obj.seek(0)
-                df_peek = pd.read_excel(file_obj, sheet_name=xl.sheet_names[0], nrows=2)
-                cols = {c.strip() for c in df_peek.columns if isinstance(c, str)}
-
-                # Star raw export: has Charge Type + Unit Number + Invoice Line Total
-                if {"Charge Type", "Unit Number", "Invoice Line Total"}.issubset(cols):
-                    return ("Star", "column headers")
-                # Premier: has Equip ID + Toll
-                if {"Equip ID"}.issubset(cols) and any("Toll" in c for c in cols):
-                    return ("Premier", "column headers")
-                # Bestpass: has Unit + Cost Center + Transaction Desc
-                if {"Unit", "Cost Center"}.issubset(cols):
-                    return ("Bestpass", "column headers")
-                # XTRA's headers are on row 3, harder to detect this way
+                # Try header on row 0 first, then row 2 (XTRA-style)
+                for hdr_row in (0, 2):
+                    if hasattr(file_obj, "seek"):
+                        file_obj.seek(0)
+                    try:
+                        df_peek = pd.read_excel(
+                            file_obj, sheet_name=xl.sheet_names[0],
+                            header=hdr_row, nrows=2
+                        )
+                        cols = {str(c).strip() for c in df_peek.columns
+                                if isinstance(c, str)}
+                        for vendor, required_cols in COLUMN_FINGERPRINTS:
+                            if required_cols.issubset(cols):
+                                return (vendor, "column headers")
+                    except Exception:
+                        continue
             except Exception:
                 pass
     except Exception as e:
-        return (None, f"could not read file: {e}")
+        # Couldn't open file at all — fall through to filename check
+        pass
+
+    # 3. Filename hint — last resort (least reliable, since users rename files)
+    for vendor, hints in FILENAME_HINTS.items():
+        if any(hint in name for hint in hints):
+            return (vendor, "filename")
 
     return (None, "could not identify vendor")
 
@@ -841,4 +862,4 @@ else:
                 )
 
 st.divider()
-st.caption("Built for Bainbridge Brokerage / LoHi Logistics finance ops · Internal use only")
+st.caption("Built for Vorto Finance Ops · Internal use only")
