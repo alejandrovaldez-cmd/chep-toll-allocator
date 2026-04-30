@@ -184,6 +184,78 @@ VENDOR_LOADERS = {
 }
 
 
+# ─── VENDOR AUTO-DETECTION ────────────────────────────────────────────────────
+# Filename keywords (case-insensitive) — checked first
+FILENAME_HINTS = {
+    "Premier":  ["premier", "ptlz", "ap bill report"],
+    "Star":     ["star"],
+    "XTRA":     ["xtra"],
+    "Bestpass": ["bestpass", "fleetworthy"],
+}
+
+# Sheet-name fingerprints — content-sniffing fallback when filename is ambiguous
+SHEET_FINGERPRINTS = {
+    "Premier":  ["Toll Lines"],
+    "Star":     ["Invoice Lines"],          # accounting's pre-mapped sheet
+    "XTRA":     ["Invoice detail"],
+    "Bestpass": ["Toll Activity"],
+}
+
+
+def detect_vendor(file_obj):
+    """Identify which vendor a file belongs to.
+
+    Strategy:
+      1. Filename keywords (fast, works for most cases)
+      2. Sheet-name fingerprint (fallback for unusual filenames)
+      3. Column-header heuristic (last resort, e.g. for raw Star "Sheet1")
+
+    Returns (vendor_name, detection_method) or (None, error_message).
+    """
+    name = getattr(file_obj, "name", "").lower()
+
+    # 1. Filename hint
+    for vendor, hints in FILENAME_HINTS.items():
+        if any(hint in name for hint in hints):
+            return (vendor, "filename")
+
+    # 2. Sheet-name fingerprint
+    try:
+        if hasattr(file_obj, "seek"):
+            file_obj.seek(0)
+        xl = pd.ExcelFile(file_obj)
+        sheets = set(xl.sheet_names)
+        for vendor, fingerprints in SHEET_FINGERPRINTS.items():
+            if any(fp in sheets for fp in fingerprints):
+                return (vendor, "sheet name")
+
+        # 3. Column-header heuristic — for raw exports w/ generic sheet names
+        # Try the first sheet and inspect headers
+        if xl.sheet_names:
+            try:
+                if hasattr(file_obj, "seek"):
+                    file_obj.seek(0)
+                df_peek = pd.read_excel(file_obj, sheet_name=xl.sheet_names[0], nrows=2)
+                cols = {c.strip() for c in df_peek.columns if isinstance(c, str)}
+
+                # Star raw export: has Charge Type + Unit Number + Invoice Line Total
+                if {"Charge Type", "Unit Number", "Invoice Line Total"}.issubset(cols):
+                    return ("Star", "column headers")
+                # Premier: has Equip ID + Toll
+                if {"Equip ID"}.issubset(cols) and any("Toll" in c for c in cols):
+                    return ("Premier", "column headers")
+                # Bestpass: has Unit + Cost Center + Transaction Desc
+                if {"Unit", "Cost Center"}.issubset(cols):
+                    return ("Bestpass", "column headers")
+                # XTRA's headers are on row 3, harder to detect this way
+            except Exception:
+                pass
+    except Exception as e:
+        return (None, f"could not read file: {e}")
+
+    return (None, "could not identify vendor")
+
+
 # ─── MAD LOOKUP BUILDER ───────────────────────────────────────────────────────
 def build_mad_lookups(mad_file_bytes):
     mar = pd.read_excel(mad_file_bytes, sheet_name="Master Asset Record")
@@ -597,17 +669,73 @@ with st.sidebar:
 
 # ─── Main: file uploads ───────────────────────────────────────────────────────
 st.subheader("📁 Upload Vendor Files")
-col1, col2 = st.columns(2)
-with col1:
-    f_premier = st.file_uploader("Premier Trailer", type=["xlsx"], key="premier")
-    f_star    = st.file_uploader("Star Leasing", type=["xlsx"], key="star")
-with col2:
-    f_xtra    = st.file_uploader("XTRA Lease", type=["xlsx"], key="xtra")
-    f_bestpass = st.file_uploader("Bestpass / Fleetworthy", type=["xlsx"], key="bestpass")
+st.caption(
+    "Drop in any of the four vendor files (Premier, Star, XTRA, Bestpass) — "
+    "the app will figure out which is which automatically. You can drag multiple files at once."
+)
+uploaded_vendor_files = st.file_uploader(
+    "Vendor files",
+    type=["xlsx"],
+    accept_multiple_files=True,
+    label_visibility="collapsed",
+    key="vendor_files",
+)
+
+# Auto-detect each uploaded file's vendor
+detected = {}      # vendor name → file object
+detection_rows = []  # rows for the user-visible detection table
+
+if uploaded_vendor_files:
+    for f in uploaded_vendor_files:
+        vendor, method = detect_vendor(f)
+        # Reset the file's read position after detection (loader will read it again)
+        if hasattr(f, "seek"):
+            f.seek(0)
+
+        if vendor and vendor not in detected:
+            detected[vendor] = f
+            detection_rows.append({
+                "File": f.name,
+                "Detected as": vendor,
+                "How": f"via {method}",
+                "Status": "✅",
+            })
+        elif vendor and vendor in detected:
+            # Duplicate — same vendor uploaded twice
+            detection_rows.append({
+                "File": f.name,
+                "Detected as": vendor,
+                "How": f"via {method}",
+                "Status": f"⚠️ Duplicate — using earlier {vendor} file instead",
+            })
+        else:
+            detection_rows.append({
+                "File": f.name,
+                "Detected as": "—",
+                "How": method,  # error message
+                "Status": "❌ Unrecognized — file will be skipped",
+            })
+
+    st.dataframe(pd.DataFrame(detection_rows), hide_index=True, use_container_width=True)
+
+    # Show what's still missing
+    missing = [v for v in ["Premier", "Star", "XTRA", "Bestpass"] if v not in detected]
+    if missing:
+        st.caption(f"Still missing: {', '.join(missing)}")
+
+# Bind the detected files to the variable names the rest of the app expects
+f_premier  = detected.get("Premier")
+f_star     = detected.get("Star")
+f_xtra     = detected.get("XTRA")
+f_bestpass = detected.get("Bestpass")
 
 st.subheader("📋 Master Asset Document")
 if mode == "MAD-driven":
-    st.caption("Required for MAD-driven mode. Export from the Vorto CPG Master Asset Document Google Sheet (the 'Master Asset Record' tab).")
+    st.caption("Required for MAD-driven mode. Open the Master Asset Document → download the 'Master Asset Record' tab as Excel → upload below.")
+    st.link_button(
+        "🔗 Open Master Asset Document",
+        "https://docs.google.com/spreadsheets/d/1KdWMMGn-2tJghHhX8LBg_-Mve5omcD_rOqJp1C-b3Cw/edit?gid=288332535#gid=288332535"
+    )
 else:
     st.caption("Optional — only used in MAD-driven mode.")
 f_mad = st.file_uploader("Vorto CPG Master Asset Document", type=["xlsx"], key="mad")
