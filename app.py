@@ -585,8 +585,22 @@ def process(vendor_files, mad_file, mode, cost_year, cost_month, bill_year, bill
         # Customer + Region: either from file's columns or from MAD
         if mode == "Pre-mapped" or mad is None:
             # Use the Customer / Region columns from the source file
-            df["Customer_resolved"] = df.get("Customer")
-            df["Region_resolved"]   = df.get("Region")
+            # If the columns don't exist (raw export), this vendor's data
+            # can't be used in Pre-mapped mode — flag and skip cleanly.
+            has_customer = "Customer" in df.columns
+            has_region   = "Region" in df.columns
+
+            if not has_customer or not has_region:
+                summary.setdefault("missing_premapped_cols", []).append({
+                    "vendor": vendor,
+                    "missing": [c for c in ["Customer", "Region"]
+                                if c not in df.columns],
+                })
+                # Skip this vendor's data in Pre-mapped mode
+                continue
+
+            df["Customer_resolved"] = df["Customer"]
+            df["Region_resolved"]   = df["Region"]
             df["Origin_resolved"]   = None
             df["match_type"] = "pre_mapped"
         else:
@@ -629,13 +643,24 @@ def process(vendor_files, mad_file, mode, cost_year, cost_month, bill_year, bill
 
     all_data = pd.concat(frames, ignore_index=True)
 
-    # Map regions to markets
-    all_data[["CHEP Market", "Reason"]] = all_data.apply(
-        lambda r: pd.Series(map_to_market(
-            r["Vendor"], r["UnitID"],
-            r["Region_resolved"], r["Origin_resolved"], r["CostCenter"]
-        )), axis=1
-    )
+    # Map regions to markets — use result_type="expand" to handle
+    # small/single-row dataframes correctly
+    if len(all_data) == 0:
+        all_data["CHEP Market"] = []
+        all_data["Reason"] = []
+    else:
+        mapping_results = all_data.apply(
+            lambda r: pd.Series(map_to_market(
+                r["Vendor"], r["UnitID"],
+                r["Region_resolved"], r["Origin_resolved"], r["CostCenter"]
+            )),
+            axis=1, result_type="expand"
+        )
+        # Defensively rename columns in case apply returned them by integer index
+        if len(mapping_results.columns) == 2:
+            mapping_results.columns = ["CHEP Market", "Reason"]
+        all_data["CHEP Market"] = mapping_results["CHEP Market"]
+        all_data["Reason"] = mapping_results["Reason"]
 
     # Track no-match rows separately
     no_match_data = pd.DataFrame()
@@ -822,10 +847,31 @@ else:
             )
 
             if allocations is None or len(allocations) == 0:
-                st.error("No CHEP toll data found. Check your files and settings.")
+                # Check if Pre-mapped mode failed because raw files were used
+                if mode == "Pre-mapped" and summary.get("missing_premapped_cols"):
+                    skipped = summary["missing_premapped_cols"]
+                    skipped_names = ", ".join(s["vendor"] for s in skipped)
+                    st.error(
+                        f"**Pre-mapped mode can't process these vendors: {skipped_names}**\n\n"
+                        f"Their files don't have the `Customer` and `Region` columns that "
+                        f"Pre-mapped mode requires (which accounting normally adds during pre-processing).\n\n"
+                        f"**Solution:** Switch to **MAD-driven mode** in the sidebar — it works "
+                        f"with raw vendor files by deriving Customer/Region from the Master Asset Document."
+                    )
+                else:
+                    st.error("No CHEP toll data found. Check your files and settings.")
             else:
                 # Summary metrics
                 st.success(f"✅ Processed successfully")
+
+                # Warn about any vendors skipped in Pre-mapped mode
+                if mode == "Pre-mapped" and summary.get("missing_premapped_cols"):
+                    skipped = summary["missing_premapped_cols"]
+                    skipped_names = ", ".join(s["vendor"] for s in skipped)
+                    st.warning(
+                        f"⚠️ **Skipped in Pre-mapped mode: {skipped_names}** — these files "
+                        f"don't have Customer/Region columns. Switch to MAD-driven mode to include them."
+                    )
 
                 total = allocations["Monthly Total"].sum()
                 n_days = calendar.monthrange(bill_year, bill_month)[1]
