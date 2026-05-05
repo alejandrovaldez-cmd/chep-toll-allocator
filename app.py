@@ -827,12 +827,32 @@ ready = (f_premier or f_star or f_xtra or f_bestpass)
 if mode == "MAD-driven":
     ready = ready and f_mad is not None
 
+# Determine which vendors are present and which are missing
+vendors_present = [v for v, f in [
+    ("Premier", f_premier), ("Star", f_star),
+    ("XTRA", f_xtra), ("Bestpass", f_bestpass)
+] if f is not None]
+vendors_missing = [v for v in ["Premier", "Star", "XTRA", "Bestpass"]
+                   if v not in vendors_present]
+is_partial_run = len(vendors_present) > 0 and len(vendors_missing) > 0
+
 if not ready:
     if mode == "MAD-driven":
         st.info("Upload at least one vendor file and the Master Asset Document to get started.")
     else:
         st.info("Upload at least one vendor file to get started.")
 else:
+    # Show partial-run warning before they click Run
+    if is_partial_run:
+        st.warning(
+            f"⚠️ **Partial run** — only {len(vendors_present)} of 4 vendors uploaded.\n\n"
+            f"**Included:** {', '.join(vendors_present)}\n\n"
+            f"**Missing:** {', '.join(vendors_missing)}\n\n"
+            f"This is fine for spot-checking a single vendor's CHEP totals. "
+            f"**If you're producing a bill-back run, make sure you don't double-bill** "
+            f"when the missing vendors are added later."
+        )
+
     if st.button("▶️ Run Allocation", type="primary", use_container_width=True):
         with st.spinner("Processing..."):
             vendor_files = {
@@ -862,7 +882,16 @@ else:
                     st.error("No CHEP toll data found. Check your files and settings.")
             else:
                 # Summary metrics
-                st.success(f"✅ Processed successfully")
+                if is_partial_run:
+                    st.success(f"✅ Processed successfully — partial run ({len(vendors_present)}/4 vendors)")
+                    st.warning(
+                        f"⚠️ **This is a partial run.** "
+                        f"Included: {', '.join(vendors_present)}. "
+                        f"Missing: {', '.join(vendors_missing)}. "
+                        f"Output Excel is labeled as partial. **Don't double-bill** when the missing vendors are added later."
+                    )
+                else:
+                    st.success(f"✅ Processed successfully")
 
                 # Warn about any vendors skipped in Pre-mapped mode
                 if mode == "Pre-mapped" and summary.get("missing_premapped_cols"):
@@ -873,7 +902,9 @@ else:
                         f"don't have Customer/Region columns. Switch to MAD-driven mode to include them."
                     )
 
-                total = allocations["Monthly Total"].sum()
+                # Force numeric in case sparse data returned mixed/object dtype
+                total = float(pd.to_numeric(allocations["Monthly Total"],
+                                            errors="coerce").fillna(0).sum())
                 n_days = calendar.monthrange(bill_year, bill_month)[1]
                 cost_label = f"{calendar.month_name[cost_month]} {cost_year}"
                 bill_label = f"{calendar.month_name[bill_month]} {bill_year}"
@@ -881,14 +912,16 @@ else:
                 col1, col2, col3, col4 = st.columns(4)
                 col1.metric("Total CHEP Tolls", f"${total:,.2f}")
                 col2.metric("Markets Allocated", len(allocations))
-                col3.metric("Per-Day Average", f"${total/n_days:,.2f}")
+                col3.metric("Per-Day Average",
+                            f"${(total/n_days) if n_days else 0:,.2f}")
                 col4.metric("Exceptions", len(exceptions))
 
                 # Vendor breakdown
                 st.subheader(f"📊 Per-Vendor Breakdown ({cost_label})")
                 if summary["vendors_loaded"]:
                     vd = pd.DataFrame(summary["vendors_loaded"])
-                    vd["amount"] = vd["amount"].apply(lambda x: f"${x:,.2f}")
+                    vd["amount"] = pd.to_numeric(vd["amount"], errors="coerce").fillna(0)
+                    vd["amount"] = vd["amount"].apply(lambda x: f"${float(x):,.2f}")
                     vd.columns = ["Vendor", "CHEP Toll Lines", "Total Amount"]
                     st.dataframe(vd, hide_index=True, use_container_width=True)
 
@@ -898,14 +931,15 @@ else:
                         st.caption("Rows where the vendor invoice date is outside the cost month")
                         for v, (n, amt) in summary["deferred"].items():
                             if n > 0:
-                                st.write(f"**{v}:** {n} rows / ${amt:,.2f}")
+                                st.write(f"**{v}:** {n} rows / ${float(amt):,.2f}")
 
                 # Allocation preview
                 st.subheader(f"💰 CHEP Market Allocation → billed across {bill_label} ({n_days} days)")
                 disp = allocations.sort_values("CHEP Market").copy()
+                disp["Monthly Total"] = pd.to_numeric(disp["Monthly Total"], errors="coerce").fillna(0)
                 disp["Per Day"] = disp["Monthly Total"] / n_days
-                disp["Monthly Total"] = disp["Monthly Total"].apply(lambda x: f"${x:,.2f}")
-                disp["Per Day"] = disp["Per Day"].apply(lambda x: f"${x:,.2f}")
+                disp["Monthly Total"] = disp["Monthly Total"].apply(lambda x: f"${float(x):,.2f}")
+                disp["Per Day"] = disp["Per Day"].apply(lambda x: f"${float(x):,.2f}")
                 st.dataframe(disp, hide_index=True, use_container_width=True)
 
                 # Exceptions
@@ -927,11 +961,25 @@ else:
                     start=f"{bill_year}-{bill_month:02d}-01",
                     periods=n_days, freq="D"
                 )
+                # Append vendor list to mode label so it shows up in the Excel
+                mode_with_vendors = mode
+                if is_partial_run:
+                    mode_with_vendors = (
+                        f"{mode} — PARTIAL RUN "
+                        f"({', '.join(vendors_present)} only; "
+                        f"missing {', '.join(vendors_missing)})"
+                    )
                 excel_bytes = build_excel_output(
                     allocations, exceptions, all_data, no_match,
-                    cost_label, bill_label, n_days, day_dates, mode
+                    cost_label, bill_label, n_days, day_dates, mode_with_vendors
                 )
-                fname = f"CHEP_Toll_Allocation_{calendar.month_abbr[bill_month]}{bill_year}.xlsx"
+                if is_partial_run:
+                    fname = (f"CHEP_Toll_Allocation_PARTIAL_"
+                             f"{'-'.join(vendors_present)}_"
+                             f"{calendar.month_abbr[bill_month]}{bill_year}.xlsx")
+                else:
+                    fname = (f"CHEP_Toll_Allocation_"
+                             f"{calendar.month_abbr[bill_month]}{bill_year}.xlsx")
                 st.download_button(
                     "📥 Download Excel",
                     data=excel_bytes,
