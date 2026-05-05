@@ -135,7 +135,7 @@ def load_premier(file_bytes):
     df = _read_excel_robust(file_bytes, sheet_name="Toll Lines")
     df["Vendor"] = "Premier"
     df["UnitID"] = df["Equip ID"].astype(str)
-    df["Amount"] = df["Line Total"]
+    df["Amount"] = pd.to_numeric(df["Line Total"], errors="coerce").fillna(0)
     df["InvoiceDate"] = pd.to_datetime(df["Invoice Date"], errors="coerce")
     df["CostCenter"] = None
     return df
@@ -170,7 +170,8 @@ def load_star(file_bytes):
 
     df["Vendor"] = "Star"
     df["UnitID"] = df["Unit Number"].astype(str)
-    df["Amount"] = df["Invoice Line Total"]
+    # Force numeric — Star raw exports sometimes store amounts as text strings
+    df["Amount"] = pd.to_numeric(df["Invoice Line Total"], errors="coerce").fillna(0)
     # Date parsing: try the known format first, fall back to flexible parsing
     df["InvoiceDate"] = pd.to_datetime(
         df["Invoice Date"], format="%m-%d-%Y", errors="coerce"
@@ -186,7 +187,7 @@ def load_xtra(file_bytes):
     df["Vendor"] = "XTRA"
     df["UnitID"] = df["Unit #"].astype(str)
     df["VIN_lookup"] = df["VIN"].astype(str)
-    df["Amount"] = df["Line Total"]
+    df["Amount"] = pd.to_numeric(df["Line Total"], errors="coerce").fillna(0)
     df["InvoiceDate"] = pd.to_datetime(df["Invoice Date"], errors="coerce")
     df["CostCenter"] = None
     return df
@@ -195,7 +196,7 @@ def load_bestpass(file_bytes):
     df = _read_excel_robust(file_bytes, sheet_name="Toll Activity")
     df["Vendor"] = "Bestpass"
     df["UnitID"] = df["Unit"].astype(str)
-    df["Amount"] = df["Amount"]
+    df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce").fillna(0)
     df["InvoiceDate"] = pd.to_datetime(df["Post Date"], errors="coerce")
     df["CostCenter"] = df["Cost Center"]
     return df
